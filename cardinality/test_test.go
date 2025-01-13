@@ -37,31 +37,37 @@ func Test(t *testing.T) {
 	builder := labels.NewBuilder(labels.Labels{})
 	var err error
 
-	// Generate series labels for pods and metrics
-	pods := generatePodLabels(1000)
-	metricNames := generateMetricNames(1000)
+	metricNames := generateMetricMap()
 
 	totalSeries := 0
-	for _, metricName := range metricNames {
-		for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
-			for _, pod := range pods {
-				builder.Reset(labels.Labels{})
-				builder.Set("__name__", metricName)
-				builder.Set("method", method)
-				builder.Set("pod", pod)
+	// Iterate over all metric names
+	for metricName, metricLabels := range metricNames {
+		// Start with the first label's values
+		labelValueCombinations := generateCombinations(metricLabels)
 
-				lbls := builder.Labels()
-				_, err = app.Append(0, lbls, 0, 1)
-				require.NoError(t, err)
-
-				hash := lbls.Hash()
-				hashBytes := make([]byte, 8)
-				binary.BigEndian.PutUint64(hashBytes, hash)
-
-				// Update the HLL sketch
-				updateHLL(hllMap, lbls, hashBytes)
-				totalSeries++
+		// Iterate over each combination of label values
+		for _, labelCombination := range labelValueCombinations {
+			// Set the metric name and the label combination
+			builder.Reset(labels.Labels{})
+			builder.Set("__name__", metricName)
+			for _, label := range labelCombination {
+				builder.Set(label.Name, label.Value)
 			}
+
+			lbls := builder.Labels()
+			_, err := app.Append(0, lbls, 0, 1)
+			if err != nil {
+				require.NoError(t, err)
+			}
+
+			// Compute the hash for the labels
+			hash := lbls.Hash()
+			hashBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(hashBytes, hash)
+
+			// Update the HLL sketch
+			updateHLL(hllMap, lbls, hashBytes)
+			totalSeries++
 		}
 	}
 
@@ -78,14 +84,14 @@ func Test(t *testing.T) {
 			name: "Pod and Metric Match",
 			matchers: []*labels.Matcher{
 				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-0"),
-				labels.MustNewMatcher(labels.MatchRegexp, "__name__", "metric-0"),
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", "http_request_total|ingester_active_series"),
 			},
 		},
 		{
 			name: "Method Match",
 			matchers: []*labels.Matcher{
 				labels.MustNewMatcher(labels.MatchRegexp, "method", "GET|POST|PUT|PATCH|DELETE"),
-				labels.MustNewMatcher(labels.MatchRegexp, "__name__", "metric-0"),
+				labels.MustNewMatcher(labels.MatchEqual, "__name__", "http_request_total"),
 				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-[0-9]"),
 			},
 		},
@@ -131,15 +137,15 @@ func Test(t *testing.T) {
 			},
 		},
 		{
-			name: "All metric with specific pod",
+			name: "Metric not equal metric with specific pod",
 			matchers: []*labels.Matcher{
-				labels.MustNewMatcher(labels.MatchNotRegexp, "__name__", "abc"),
+				labels.MustNewMatcher(labels.MatchNotRegexp, "__name__", "ingester_active_series"),
 				labels.MustNewMatcher(labels.MatchRegexp, "method", ".+"),
 				labels.MustNewMatcher(labels.MatchEqual, "pod", "pod-1"),
 			},
 		},
 		{
-			name: "1 million",
+			name: "900K",
 			matchers: []*labels.Matcher{
 				labels.MustNewMatcher(labels.MatchEqual, "method", "GET"),
 				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-([0-9][0-9][0-9])"),
@@ -153,17 +159,27 @@ func Test(t *testing.T) {
 				labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".*"),
 			},
 		},
+		{
+			name: "1M with regex",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "user", ".*"),
+				labels.MustNewMatcher(labels.MatchRegexp, "instance", ".*"),
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", "blocks_loaded"),
+			},
+		},
 	}
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
 			actualCard := getActualCard(t, store, tt.matchers...)
-			// Compare the actual and estimated cardinality
+
+			// Get estimated cardinality
 			jacaardEstimate := estimateForMatchersJaccardPairWise(hllMap, tt.matchers...)
 			inExEstimate := estimateUsingInclusionExclusion(hllMap, tt.matchers...)
 
 			t.Logf("Test: %s, Actual Cardinality: %d, Jacaard Estimated Cardinality: %d, Inclusion-Exclusion Cardinality: %d", tt.name, actualCard, jacaardEstimate, inExEstimate)
 
+			// Compare the actual and estimated cardinality
 			validateDelta(t, actualCard, inExEstimate, "InclusionExclusion")
 			validateDelta(t, actualCard, jacaardEstimate, "Jacaard")
 		})
@@ -195,21 +211,114 @@ func validateDelta(t *testing.T, actual, estimate int64, name string) {
 }
 
 // Helper function to generate pod labels
-func generatePodLabels(count int) []string {
-	pods := make([]string, 0, count)
+func generateValues(pre string, count int) []string {
+	values := make([]string, 0, count)
 	for i := 0; i < count; i++ {
-		pods = append(pods, internString(fmt.Sprintf("pod-%d", i)))
+		values = append(values, internString(fmt.Sprintf("%s-%d", pre, i)))
 	}
-	return pods
+	return values
 }
 
-// Helper function to generate metric names
-func generateMetricNames(count int) []string {
-	metricNames := make([]string, 0, count)
-	for i := 0; i < count; i++ {
-		metricNames = append(metricNames, internString(fmt.Sprintf("metric-%d", i)))
+type labelValue struct {
+	name      string
+	values    []string
+	valueFunc func() []string
+}
+
+func generateMetricMap() map[string][]labelValue {
+	metricNameMap := map[string][]labelValue{
+		"http_request_total": {
+			{
+				name:   "method",
+				values: []string{"GET", "POST", "PUT", "PATCH", "DELETE"},
+			},
+			{
+				name: "pod",
+				valueFunc: func() []string {
+					return generateValues("pod", 1000)
+				},
+			},
+			{
+				name: "user",
+				valueFunc: func() []string {
+					return generateValues("user", 100)
+				},
+			},
+		},
+		"ingester_active_series": {
+			{
+				name:   "api",
+				values: []string{"QueryStream", "Push", "MetricsForLabelMatchers", "LabelValues", "LabelNames"},
+			},
+			{
+				name: "ingester",
+				valueFunc: func() []string {
+					return generateValues("ingester", 1000)
+				},
+			},
+			{
+				name: "user",
+				valueFunc: func() []string {
+					return generateValues("user", 100)
+				},
+			},
+		},
+		"blocks_loaded": {
+			{
+				name: "block",
+				valueFunc: func() []string {
+					return generateValues("ID", 1000)
+				},
+			},
+			{
+				name: "instance",
+				valueFunc: func() []string {
+					return generateValues("store-gateway", 100)
+				},
+			},
+			{
+				name: "user",
+				valueFunc: func() []string {
+					return generateValues("user", 10)
+				},
+			},
+		},
 	}
-	return metricNames
+
+	return metricNameMap
+}
+
+func generateCombinations(metricLabels []labelValue) [][]labels.Label {
+	// Prepare to store all combinations of labels and their values
+	var labelCombinations [][]labels.Label
+	// Initialize with an empty combination
+	labelCombinations = append(labelCombinations, []labels.Label{})
+
+	// For each label, generate all possible combinations
+	for _, label := range metricLabels {
+		// Get the values for this label
+		var values []string
+		if label.valueFunc != nil {
+			values = label.valueFunc()
+		} else {
+			values = label.values
+		}
+
+		// Create new combinations by appending each value for the current label
+		var newCombinations [][]labels.Label
+		for _, combination := range labelCombinations {
+			for _, value := range values {
+				// Append this value to the existing combination
+				newCombination := append(combination, labels.Label{Name: label.name, Value: value})
+				newCombinations = append(newCombinations, newCombination)
+			}
+		}
+
+		// Update the labelCombinations with the new combinations
+		labelCombinations = newCombinations
+	}
+
+	return labelCombinations
 }
 
 // Helper function to update HLL sketch for a given label set
