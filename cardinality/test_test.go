@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/axiomhq/hyperminhash"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -26,7 +27,59 @@ func internString(s string) string {
 	return s
 }
 
-func Test(t *testing.T) {
+func BenchmarkCardinality(b *testing.B) {
+	store, err := teststorage.NewWithError()
+	require.NoError(b, err)
+	defer store.Close()
+
+	hllIndex := make(map[string]map[string]*hyperminhash.Sketch)
+	bitmapIndex := make(map[string]map[string]*roaring64.Bitmap)
+	app := store.Appender(context.TODO())
+
+	totalSeries, err := ingestData(app, func(ref storage.SeriesRef, lbls labels.Labels) {
+		hash := lbls.Hash()
+		hashBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(hashBytes, hash)
+
+		updateHLL(hllIndex, lbls, hashBytes)
+		updateBitmap(bitmapIndex, lbls, ref)
+	})
+
+	require.NoError(b, err)
+	b.Logf("Total series: %d", totalSeries)
+
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchRegexp, "user", ".*"),
+		labels.MustNewMatcher(labels.MatchRegexp, "instance", ".*"),
+		labels.MustNewMatcher(labels.MatchRegexp, "__name__", "blocks_loaded"),
+	}
+
+	card, err := getActualCard(store, matchers...)
+	require.NoError(b, err)
+
+	b.Run("Jaccard Estimation", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			jaccardEstimate := estimateForMatchersJaccardPairWise(hllIndex, matchers...)
+			delta := math.Abs(float64(card - jaccardEstimate))
+			threshold := float64(50000)
+
+			require.LessOrEqual(b, delta, threshold) // Ensure the result is valid
+		}
+	})
+
+	b.Run("Bitmap Estimation", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			bitmapEstimate := getCardinalityFromBitmapIndex(bitmapIndex, matchers...)
+			delta := math.Abs(float64(card - int64(bitmapEstimate)))
+			threshold := float64(50000)
+
+			require.LessOrEqual(b, delta, threshold) // Ensure the result is valid
+		}
+	})
+
+}
+
+func TestHLL(t *testing.T) {
 	// Step 1: Create the series and insert into the HLL
 	store := teststorage.New(t)
 	defer store.Close()
@@ -34,47 +87,16 @@ func Test(t *testing.T) {
 	hllMap := make(map[string]map[string]*hyperminhash.Sketch)
 	app := store.Appender(context.TODO())
 
-	builder := labels.NewBuilder(labels.Labels{})
-	var err error
+	totalSeries, err := ingestData(app, func(ref storage.SeriesRef, lbls labels.Labels) {
+		hash := lbls.Hash()
+		hashBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(hashBytes, hash)
 
-	metricNames := generateMetricMap()
+		updateHLL(hllMap, lbls, hashBytes)
+	})
 
-	totalSeries := 0
-	// Iterate over all metric names
-	for metricName, metricLabels := range metricNames {
-		// Start with the first label's values
-		labelValueCombinations := generateCombinations(metricLabels)
-
-		// Iterate over each combination of label values
-		for _, labelCombination := range labelValueCombinations {
-			// Set the metric name and the label combination
-			builder.Reset(labels.Labels{})
-			builder.Set("__name__", metricName)
-			for _, label := range labelCombination {
-				builder.Set(label.Name, label.Value)
-			}
-
-			lbls := builder.Labels()
-			_, err := app.Append(0, lbls, 0, 1)
-			if err != nil {
-				require.NoError(t, err)
-			}
-
-			// Compute the hash for the labels
-			hash := lbls.Hash()
-			hashBytes := make([]byte, 8)
-			binary.BigEndian.PutUint64(hashBytes, hash)
-
-			// Update the HLL sketch
-			updateHLL(hllMap, lbls, hashBytes)
-			totalSeries++
-		}
-	}
-
-	t.Logf("Total series: %d", totalSeries)
-
-	err = app.Commit()
 	require.NoError(t, err)
+	t.Logf("Total series: %d", totalSeries)
 
 	testCases := []struct {
 		name     string
@@ -171,7 +193,8 @@ func Test(t *testing.T) {
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			actualCard := getActualCard(t, store, tt.matchers...)
+			actualCard, err := getActualCard(store, tt.matchers...)
+			require.NoError(t, err)
 
 			// Get estimated cardinality
 			jacaardEstimate := estimateForMatchersJaccardPairWise(hllMap, tt.matchers...)
@@ -189,10 +212,172 @@ func Test(t *testing.T) {
 	printProfile()
 }
 
-func getActualCard(t *testing.T, store storage.Storage, matchers ...*labels.Matcher) int64 {
+func TestBitmaps(t *testing.T) {
+	// Step 1: Create the series and insert into the HLL
+	store := teststorage.New(t)
+	defer store.Close()
+
+	bitmapIndex := make(map[string]map[string]*roaring64.Bitmap)
+	app := store.Appender(context.TODO())
+
+	totalSeries, err := ingestData(app, func(ref storage.SeriesRef, lbls labels.Labels) {
+		updateBitmap(bitmapIndex, lbls, ref)
+	})
+	require.NoError(t, err)
+	t.Logf("Total series: %d", totalSeries)
+
+	testCases := []struct {
+		name     string
+		matchers []*labels.Matcher
+	}{
+		{
+			name: "Pod and Metric Match",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-0"),
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", "http_request_total|ingester_active_series"),
+			},
+		},
+		{
+			name: "Method Match",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "method", "GET|POST|PUT|PATCH|DELETE"),
+				labels.MustNewMatcher(labels.MatchEqual, "__name__", "http_request_total"),
+				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-[0-9]"),
+			},
+		},
+		{
+			name: "Heavy Match",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchEqual, "method", "GET"),
+			},
+		},
+		{
+			name: "Heavy Match with pods",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchEqual, "method", "GET"),
+				labels.MustNewMatcher(labels.MatchEqual, "pod", "pod-0"),
+			},
+		},
+		{
+			name: "Heavy Match",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "method", ".+"),
+			},
+		},
+		{
+			name: "All metric",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".+"),
+			},
+		},
+		{
+			name: "All metric with unknown pod",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".+"),
+				labels.MustNewMatcher(labels.MatchRegexp, "method", ".+"),
+				labels.MustNewMatcher(labels.MatchRegexp, "pod", "unknown"),
+			},
+		},
+		{
+			name: "All metric with specific pod",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".+"),
+				labels.MustNewMatcher(labels.MatchRegexp, "method", ".+"),
+				labels.MustNewMatcher(labels.MatchEqual, "pod", "pod-1"),
+			},
+		},
+		{
+			name: "Metric not equal metric with specific pod",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchNotRegexp, "__name__", "ingester_active_series"),
+				labels.MustNewMatcher(labels.MatchRegexp, "method", ".+"),
+				labels.MustNewMatcher(labels.MatchEqual, "pod", "pod-1"),
+			},
+		},
+		{
+			name: "900K",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchEqual, "method", "GET"),
+				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-([0-9][0-9][0-9])"),
+			},
+		},
+		{
+			name: "20K",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "method", "GET|POST"),
+				labels.MustNewMatcher(labels.MatchRegexp, "pod", "pod-([0-9])"),
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", ".*"),
+			},
+		},
+		{
+			name: "1M with regex",
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "user", ".*"),
+				labels.MustNewMatcher(labels.MatchRegexp, "instance", ".*"),
+				labels.MustNewMatcher(labels.MatchRegexp, "__name__", "blocks_loaded"),
+			},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			actualCard, err := getActualCard(store, tt.matchers...)
+			require.NoError(t, err)
+
+			// Get estimated cardinality
+			estimated := getCardinalityFromBitmapIndex(bitmapIndex, tt.matchers...)
+
+			t.Logf("Test: %s, Actual Cardinality: %d, Estimated Cardinality: %d", tt.name, actualCard, estimated)
+
+			// Compare the actual and estimated cardinality
+			validateDelta(t, actualCard, int64(estimated), "BitMap")
+		})
+	}
+
+	// pprof
+	printProfile()
+}
+
+func ingestData(app storage.Appender, updateFn func(storage.SeriesRef, labels.Labels)) (int, error) {
+	builder := labels.NewBuilder(labels.Labels{})
+
+	metricNames := generateMetricMap()
+
+	totalSeries := 0
+	// Iterate over all metric names
+	for metricName, metricLabels := range metricNames {
+		// Start with the first label's values
+		labelValueCombinations := generateCombinations(metricLabels)
+
+		// Iterate over each combination of label values
+		for _, labelCombination := range labelValueCombinations {
+			// Set the metric name and the label combination
+			builder.Reset(labels.Labels{})
+			builder.Set("__name__", metricName)
+			for _, label := range labelCombination {
+				builder.Set(label.Name, label.Value)
+			}
+
+			lbls := builder.Labels()
+			ref, err := app.Append(0, lbls, 0, 1)
+			if err != nil {
+				return 0, err
+			}
+
+			updateFn(ref, lbls)
+			totalSeries++
+		}
+	}
+	err := app.Commit()
+	return totalSeries, err
+}
+
+func getActualCard(store storage.Storage, matchers ...*labels.Matcher) (int64, error) {
 	// Query the actual cardinality using the provided matchers
 	querier, err := store.Querier(0, math.MaxInt64)
-	require.NoError(t, err)
+	if err != nil {
+		return 0, err
+	}
 
 	set := querier.Select(context.TODO(), false, nil, matchers...)
 	card := 0
@@ -200,7 +385,7 @@ func getActualCard(t *testing.T, store storage.Storage, matchers ...*labels.Matc
 		card++
 	}
 
-	return int64(card)
+	return int64(card), nil
 }
 
 func validateDelta(t *testing.T, actual, estimate int64, name string) {
@@ -322,16 +507,16 @@ func generateCombinations(metricLabels []labelValue) [][]labels.Label {
 }
 
 // Helper function to update HLL sketch for a given label set
-func updateHLL(hllMap map[string]map[string]*hyperminhash.Sketch, lbls labels.Labels, hashBytes []byte) {
+func updateHLL(index map[string]map[string]*hyperminhash.Sketch, lbls labels.Labels, hashBytes []byte) {
 	for _, l := range lbls {
 		lName := internString(l.Name)
 		lValue := internString(l.Value)
 
 		// Retrieve or create the value map
-		valueMap, ok := hllMap[lName]
+		valueMap, ok := index[lName]
 		if !ok {
 			valueMap = make(map[string]*hyperminhash.Sketch)
-			hllMap[lName] = valueMap
+			index[lName] = valueMap
 		}
 
 		// Retrieve or create the HLL sketch for the label value
@@ -344,6 +529,90 @@ func updateHLL(hllMap map[string]map[string]*hyperminhash.Sketch, lbls labels.La
 		// Add the hash to the HLL sketch
 		hll.Add(hashBytes)
 	}
+}
+
+// Helper function to update Bitmap Index using Roaring Bitmaps
+func updateBitmap(index map[string]map[string]*roaring64.Bitmap, lbls labels.Labels, ref storage.SeriesRef) {
+	for _, l := range lbls {
+		lName := internString(l.Name)
+		lValue := internString(l.Value)
+
+		// Retrieve or create the value map
+		valueMap, ok := index[lName]
+		if !ok {
+			valueMap = make(map[string]*roaring64.Bitmap)
+			index[lName] = valueMap
+		}
+
+		// Retrieve or create the roaring bitmap for the label value
+		bitmap, ok := valueMap[lValue]
+		if !ok {
+			bitmap = roaring64.NewBitmap()
+			valueMap[lValue] = bitmap
+		}
+
+		bitmap.Add(uint64(ref))
+	}
+}
+
+// getUnionBitmapForMatcher returns the unioned bitmap for a single matcher.
+func getUnionBitmapForMatcher(bitmapIndex map[string]map[string]*roaring64.Bitmap, matcher *labels.Matcher) *roaring64.Bitmap {
+	unionBitmap := roaring64.NewBitmap()
+
+	if valueMap, ok := bitmapIndex[matcher.Name]; ok {
+		switch matcher.Type {
+		case labels.MatchEqual:
+			if bitmap, exists := valueMap[matcher.Value]; exists {
+				unionBitmap.Or(bitmap) // Exact match: Add the single bitmap
+			}
+
+		case labels.MatchRegexp:
+			for value, bitmap := range valueMap {
+				if matcher.Matches(value) {
+					unionBitmap.Or(bitmap) // Regex match: Union all matching bitmaps
+				}
+			}
+
+		case labels.MatchNotEqual:
+			for value, bitmap := range valueMap {
+				if value != matcher.Value {
+					unionBitmap.Or(bitmap) // Exclude the specified value
+				}
+			}
+
+		case labels.MatchNotRegexp:
+			for value, bitmap := range valueMap {
+				if !matcher.Matches(value) {
+					unionBitmap.Or(bitmap) // Exclude values matching the regex
+				}
+			}
+		}
+	}
+
+	return unionBitmap
+}
+
+// getCardinalityFromBitmapIndex returns the intersection of bitmaps for multiple matchers.
+func getCardinalityFromBitmapIndex(bitmapIndex map[string]map[string]*roaring64.Bitmap, matchers ...*labels.Matcher) uint64 {
+	if len(matchers) == 0 {
+		return 0 // Return an empty bitmap if no matchers are provided
+	}
+
+	// Initialize with the bitmap for the first matcher
+	intersectionBitmap := getUnionBitmapForMatcher(bitmapIndex, matchers[0])
+
+	// Intersect with the bitmaps for subsequent matchers
+	for _, matcher := range matchers[1:] {
+		matcherBitmap := getUnionBitmapForMatcher(bitmapIndex, matcher)
+		intersectionBitmap.And(matcherBitmap)
+
+		// If the intersection is empty, return immediately
+		if intersectionBitmap.IsEmpty() {
+			return 0
+		}
+	}
+
+	return intersectionBitmap.GetCardinality()
 }
 
 func printProfile() {
