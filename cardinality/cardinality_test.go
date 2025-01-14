@@ -21,6 +21,7 @@ func BenchmarkCardinality(b *testing.B) {
 
 	hmhIndex := NewHyperMinHashIndex()
 	bitmapIndex := NewBitmapIndex()
+	blockIndex := NewBlockIndex(store)
 	app := store.Appender(context.TODO())
 
 	totalSeries, err := ingestData(app, func(ref storage.SeriesRef, lbls labels.Labels) {
@@ -60,6 +61,15 @@ func BenchmarkCardinality(b *testing.B) {
 			require.LessOrEqual(b, delta, threshold)
 		}
 	})
+
+	b.Run("Block", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			estimate := blockIndex.GetCardinality(matchers...)
+			delta := math.Abs(float64(card - estimate))
+
+			require.LessOrEqual(b, delta, threshold)
+		}
+	})
 }
 
 func TestCardinality(t *testing.T) {
@@ -68,6 +78,7 @@ func TestCardinality(t *testing.T) {
 
 	bitmapIndex := NewBitmapIndex()
 	hmhIndex := NewHyperMinHashIndex()
+	blockIndex := NewBlockIndex(store)
 
 	app := store.Appender(context.TODO())
 
@@ -177,6 +188,7 @@ func TestCardinality(t *testing.T) {
 	}{
 		{"Bitmap", bitmapIndex},
 		{"HyperMinMax", hmhIndex},
+		{"BlockIndex", blockIndex},
 	}
 
 	for _, tt := range testCases {
